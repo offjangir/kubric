@@ -23,7 +23,8 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 from tensorflow_graphics.geometry.transformation import rotation_matrix_3d
-
+import cv2
+import numpy as np
 
 def project_point(cam, point3d, num_frames):
   """Compute the image space coordinates [0, 1] for a set of points.
@@ -407,7 +408,7 @@ def single_object_reproject(
     # world is convex; can't face away from cam.
     faces_away = tf.zeros([tf.shape(pt)[0], num_frames], dtype=tf.bool)
 
-  return obj_reproj, tf.logical_or(faces_away, obj_occ), depth_proj
+  return obj_reproj, tf.logical_or(faces_away, obj_occ), depth_proj, world_pos
 
 
 def get_num_to_sample(counts, max_seg_id, max_sampled_frac, tracks_to_sample):
@@ -516,17 +517,27 @@ def track_points(
       applications.
 
   Returns:
-    A set of queries, randomly sampled from the video (with a bias toward
+    query_points:
+      A set of queries, randomly sampled from the video (with a bias toward
       objects), of shape [num_points, 3].  Each point is [t, y, x], where
-      t is time.  All points are in pixel/frame coordinates.
-    The trajectory for each query point, of shape [num_points, num_frames, 3].
-      Each point is [x, y].  Points are in pixel coordinates
-    Occlusion flag for each point, of shape [num_points, num_frames].  This is
+      t is time.  Points are in pixel/frame coordinates.
+      [num_frames, height, width].
+    query_points_3d:
+      Corresponding 3d points to query points [z, y, x] - Basically the world point that was reprojected in 2D     
+    target_points:
+      The trajectory for each query point, of shape [num_points, num_frames, 2].
+      Each point is [x, y].  Points are in pixel/frame coordinates.
+    target_points_3d:
+      correspoing trejectory in 3d [num_points, num_frames, 3]
+    occlusion:
+      Occlusion flag for each point, of shape [num_points, num_frames].  This is
       a boolean, where True means the point is occluded.
 
   """
   chosen_points = []
+  chosen_points_3d = []
   all_reproj = []
+  all_reproj_3d = []
   all_occ = []
   chosen_points_depth = []
   all_reproj_depth = []
@@ -708,7 +719,7 @@ def track_points(
     chosen_points_depth.append(tf.concat(pt_depth, axis=0))
 
     # Finally, compute the reprojections for this particular object.
-    obj_reproj, obj_occ, reproj_depth = tf.cond(
+    obj_reproj, obj_occ, reproj_depth, world_pos = tf.cond(
         tf.shape(pt)[0] > 0,
         functools.partial(
             single_object_reproject,
@@ -730,10 +741,13 @@ def track_points(
         lambda: (  # pylint: disable=g-long-lambda
             tf.zeros([0, num_frames, 2], dtype=tf.float32),
             tf.zeros([0, num_frames], dtype=tf.bool),
-            tf.zeros([0, num_frames], dtype=tf.float32)))
+            tf.zeros([0, num_frames], dtype=tf.float32),
+            tf.zeros([0, num_frames, 3], dtype=tf.float32)))
     all_reproj.append(obj_reproj)
+    all_reproj_3d.append(world_pos)
     all_occ.append(obj_occ)
     all_reproj_depth.append(reproj_depth)
+    chosen_points_3d.append(pt)
 
   # Points are currently in pixel coordinates of the original video.  We now
   # convert them to coordinates within the window frame, and rescale to
@@ -746,6 +760,7 @@ def track_points(
   wd = wd[tf.newaxis, tf.newaxis, :]
   coord_multiplier = [num_frames, input_size[0], input_size[1]]
   all_reproj = tf.concat(all_reproj, axis=0)
+  all_reproj_3d =  tf.concat(all_reproj_3d, axis=0)
   # We need to extract x,y, but the format of the window is [t1,y1,x1,t2,y2,x2]
   window_size = wd[:, :, 5:3:-1] - wd[:, :, 2:0:-1]
   window_top_left = wd[:, :, 2:0:-1]
@@ -757,6 +772,7 @@ def track_points(
 
   # chosen_points is [num_points, (z,y,x)]
   chosen_points = tf.concat(chosen_points, axis=0)
+  chosen_points_3d = tf.concat(chosen_points_3d, axis=0)
 
   if snap_to_occluder:
     # For query points that are near to an occlusion boundary, occasionally
@@ -810,9 +826,16 @@ def track_points(
   all_occ = _pad_with_last_row(all_occ, tracks_to_sample)
   all_relative_depth = _pad_with_last_row(all_relative_depth, tracks_to_sample)
 
+  print("Chose Point", chosen_points.shape)
+  print("3d Choose Point", chosen_points_3d.shape)
+  print("Target Point", all_reproj.shape)
+  print("Target Point 3d", all_reproj_3d.shape)
+
   return (
       tf.cast(chosen_points, tf.float32),
+      tf.cast(chosen_points_3d, tf.float32),
       tf.cast(all_reproj, tf.float32),
+      tf.cast(all_reproj_3d, tf.float32),
       all_occ,
       all_relative_depth,
   )
@@ -890,9 +913,13 @@ def add_tracks(data,
       objects), of shape [num_points, 3].  Each point is [t, y, x], where
       t is time.  Points are in pixel/frame coordinates.
       [num_frames, height, width].
+    query_points_3d:
+      Corresponding 3d points to query points [z, y, x] - Basically the world point that was reprojected in 2D     
     target_points:
       The trajectory for each query point, of shape [num_points, num_frames, 3].
       Each point is [x, y].  Points are in pixel/frame coordinates.
+    target_points_3d:
+      correspoing trejectory in 3d
     occlusion:
       Occlusion flag for each point, of shape [num_points, num_frames].  This is
       a boolean, where True means the point is occluded.
@@ -923,7 +950,7 @@ def add_tracks(data,
                               dtype=tf.int32,
                               shape=[4])
 
-  query_points, target_points, occluded, relative_depth = track_points(
+  query_points, query_points_3d, target_points, target_points_3d, occluded, relative_depth = track_points(
       data['object_coordinates'], data['depth'],
       data['metadata']['depth_range'], data['segmentations'],
       data['normal'],
@@ -934,9 +961,50 @@ def add_tracks(data,
       sampling_stride, max_seg_id, max_sampled_frac, snap_to_occluder)
   video = data['video']
 
+#  We want projected 3D points for Each frame 
+#  Do we want sampling as its done in 2d or all the points?
+#  Kubrics is running  just from frame 1  
+#  Intrinsics we already have
+#  unproject for whole thing or take care in if else  - got Points
+#  Depth we have but do you need metric depth?
+
+
+#   # 3D point cloud Data Gen
+
+# # sample = {
+# #             ‘vid_dir’: video_dir,
+# #             ‘point_trajectory’: gt_point_trajectory, # (n_sampled_frames, m_sampled_points, 3)
+# #             ‘gt_visibility’: gt_visibility, # (n_sampled_frames, m_sampled_points)
+# #             ‘rgbs’: rgb_map,  # (n_sampled_frames, 3, H, W)
+# #             ‘depth_map’: depth_map,  # (n_sampled_frames, 3, H, W)
+# #             ‘intrinsics’: intrinsics,
+# #             ‘extrinsics’: extrinsics,
+# #         }
+
+  #  Vid Dir = Results
+  # Making RGB Map 
+  # rgb_map = video 
+  # Converting to Depth Map vector (N frames x H x W x 1)
+  depth_range_f32 = tf.cast(data['metadata']['depth_range'], tf.float32)
+  depth_min = depth_range_f32[0]
+  depth_max = depth_range_f32[1]
+  depth_f32 = tf.cast(data['depth'], tf.float32)
+  depth_map = depth_min + depth_f32 * (depth_max-depth_min) / 65535
+# 
+  intrinsics, matrix_world = get_camera_matrices(
+      data['camera']['focal_length'],
+      data['camera']['positions'],
+       data['camera']['quaternions'],
+      data['camera']['sensor_width'],
+      data['object_coordinates'].shape.as_list()[1:3],
+      num_frames=data['object_coordinates'].shape.as_list()[0],
+  )
+
   shp = video.shape.as_list()
   query_points.set_shape([tracks_to_sample, 3])
+  query_points_3d.set_shape([tracks_to_sample, 3])
   target_points.set_shape([tracks_to_sample, num_frames, 2])
+  target_points_3d.set_shape([tracks_to_sample, num_frames, 3])
   relative_depth.set_shape([tracks_to_sample, num_frames])
   occluded.set_shape([tracks_to_sample, num_frames])
 
@@ -957,9 +1025,14 @@ def add_tracks(data,
     query_points = query_points * np.array([1, -1, 1])
   res = {
       'query_points': query_points,
+      'query_points_3d': query_points_3d,
       'target_points': target_points,
+      'target_points_3d':target_points_3d,
       'relative_depth': relative_depth,
+      'depth_map': depth_map, 
       'occluded': occluded,
+      'intrinsics': intrinsics,  
+      'extrensic': matrix_world,
       'video': video / (255. / 2.) - 1.,
   }
   return res
@@ -1104,14 +1177,73 @@ def plot_tracks(rgb, points, occluded, trackgroup=None):
   return np.stack(disp, axis=0)
 
 
+# def main():
+#   ds = tfds.as_numpy(create_point_tracking_dataset(shuffle_buffer_size=None))
+#   for i, data in enumerate(ds):
+#       disp = plot_tracks(data['video'] * .5 + .5, data['target_points'], data['occluded'])
+     
+#       # Assuming disp contains frames with shape (H, W, 3) in the format suitable for OpenCV
+#       height, width = disp[0].shape[:2]
+#       out = cv2.VideoWriter(f'{i}.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+#       for frame in disp:
+#           # Convert to uint8 if necessary
+#           frame = (frame * 255).astype(np.uint8)
+#           out.write(frame)
+#       out.release()
+#       break
+
+
 def main():
+  import json
+  import os
+
   ds = tfds.as_numpy(create_point_tracking_dataset(shuffle_buffer_size=None))
+
+  output_dir = 'output_data'
+  os.makedirs(output_dir, exist_ok=True)
+
+  # Iterate through the dataset
   for i, data in enumerate(ds):
-    disp = plot_tracks(data['video'] * .5 + .5, data['target_points'],
-                       data['occluded'])
-    media.write_video(f'{i}.mp4', disp, fps=10)
-    if i > 10:
-      break
+      # Process the data to create the res dictionary
+      video = data['video'] 
+      res = {
+          'query_points': data['query_points'].tolist(),
+          'query_points_3d': data['query_points_3d'].tolist(),
+          'target_points': data['target_points'].tolist(),
+          'target_points_3d': data['target_points_3d'].tolist(),
+          'relative_depth': data['relative_depth'].tolist(),
+          'depth_map': data['depth_map'].tolist(),
+          'occluded': data['occluded'].tolist(),
+          'intrinsics': data['intrinsics'].tolist(),  # Ensure this is serializable
+          'extrensic': data['extrensic'].tolist(),    # Ensure this is serializable
+          'video': video.tolist(),  # Convert video to list for JSON serialization
+      }
+
+      # Save the video as before
+      # disp = plot_tracks(data['video'] * 0.5 + 0.5, data['target_points'], data['occluded'])
+      height, width = disp[0].shape[:2]
+
+      # Create a VideoWriter object to save the video
+      video_filename = os.path.join(output_dir, f'video_{i}.mp4')
+      out = cv2.VideoWriter(video_filename, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+
+      # Write each frame to the video
+      for frame in disp:
+          # Convert the frame to uint8 format if necessary
+          frame = (frame * 255).astype(np.uint8)  # Scale back to [0, 255]
+          out.write(frame)
+
+      # Release the VideoWriter object after writing all frames
+      out.release()
+
+      # Save the res data to a JSON file
+      json_filename = os.path.join(output_dir, f'data_{i}.json')
+      with open(json_filename, 'w') as json_file:
+          json.dump(res, json_file, indent=4)
+
+      # Break after processing the first video for demonstration purposes
+      if i == 10:
+        break
 
 
 if __name__ == '__main__':
