@@ -1220,7 +1220,7 @@ def main():
       }
 
       # Save the video as before
-      # disp = plot_tracks(data['video'] * 0.5 + 0.5, data['target_points'], data['occluded'])
+      disp = plot_tracks(data['video'] * 0.5 + 0.5, data['target_points'], data['occluded'])
       height, width = disp[0].shape[:2]
 
       # Create a VideoWriter object to save the video

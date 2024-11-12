@@ -15,7 +15,7 @@
 """Root of the kubric module."""
 
 # --- auto-computed by setup.py, source version is always at HEAD
-__version__ = "HEAD"
+__version__ = "2024.10.16.13.35.5"
 
 # --- basic kubric types
 from pyquaternion import Quaternion
